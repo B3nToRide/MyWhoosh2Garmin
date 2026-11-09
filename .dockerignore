@@ -1,0 +1,8 @@
+# Allowlist: never send credentials, sessions, backups or .git to the builder.
+**
+!Dockerfile
+!myWhoosh2Garmin.py
+!scheduler.py
+!runtime.py
+!android/
+!android/requirements.txt

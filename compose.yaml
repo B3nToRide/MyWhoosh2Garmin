@@ -1,0 +1,46 @@
+services:
+  sync:
+    build: .
+    image: mywhoosh2garmin:local
+    # Match the owner of the private host files. Compose file secrets do not
+    # implement uid/gid remapping for bind-mounted files.
+    user: "${CONTAINER_UID:?Set CONTAINER_UID in .docker.env}:${CONTAINER_GID:?Set CONTAINER_GID in .docker.env}"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+    mem_limit: 256m
+    environment:
+      TZ: ${TZ:-Europe/Paris}
+      SCHEDULE_MODE: ${SCHEDULE_MODE:-daily}
+      SCHEDULE_TIME: ${SCHEDULE_TIME:-20:00}
+      SCHEDULE_INTERVAL: ${SCHEDULE_INTERVAL:-4h}
+      SYNC_MAX_ATTEMPTS: ${SYNC_MAX_ATTEMPTS:-3}
+      SYNC_RETRY_DELAY_SECONDS: ${SYNC_RETRY_DELAY_SECONDS:-300}
+      SYNC_TIMEOUT_SECONDS: ${SYNC_TIMEOUT_SECONDS:-1800}
+      MYWHOOSH_EMAIL_FILE: /run/secrets/mywhoosh_email
+      MYWHOOSH_PASSWORD_FILE: /run/secrets/mywhoosh_password
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+    secrets:
+      - mywhoosh_email
+      - mywhoosh_password
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    logging:
+      driver: local
+      options:
+        max-size: 5m
+        max-file: "3"
+
+secrets:
+  mywhoosh_email:
+    file: ${MYWHOOSH_EMAIL_SECRET_FILE:?Set MYWHOOSH_EMAIL_SECRET_FILE in .docker.env}
+  mywhoosh_password:
+    file: ${MYWHOOSH_PASSWORD_SECRET_FILE:?Set MYWHOOSH_PASSWORD_SECRET_FILE in .docker.env}

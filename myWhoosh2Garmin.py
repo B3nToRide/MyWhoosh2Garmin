@@ -35,16 +35,16 @@ import json
 import math
 import sys
 import logging
-import re
+from logging.handlers import RotatingFileHandler
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from typing import List, Optional
-#import tkinter as tk
-#from tkinter import filedialog
 from datetime import datetime, timedelta, timezone
 from getpass import getpass
 from pathlib import Path
+
+from runtime import LockBusy, UserError, atomic_target, process_lock, write_json
 
 import garth
 import requests
@@ -53,6 +53,7 @@ from garth.exc import GarthException, GarthHTTPError
 from fit_tool.fit_file import FitFile
 from fit_tool.fit_file_builder import FitFileBuilder
 from fit_tool.profile.messages.file_id_message import FileIdMessage
+from fit_tool.profile.messages.device_info_message import DeviceInfoMessage
 from fit_tool.profile.messages.record_message import (
     RecordMessage,
     RecordTemperatureField
@@ -65,7 +66,9 @@ from fit_tool.profile.profile_type import (
     Event,
     EventType,
     FileType,
+    GarminProduct,
     LapTrigger,
+    Manufacturer,
     SessionTrigger,
     Sport,
     SubSport
@@ -73,17 +76,12 @@ from fit_tool.profile.profile_type import (
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-log_file_path = SCRIPT_DIR / "myWhoosh2Garmin.log"
-json_file_path = SCRIPT_DIR /  "backup_path.json"
+DATA_DIR = Path(os.environ.get("MYWHOOSH_DATA_DIR", SCRIPT_DIR)).expanduser()
+json_file_path = DATA_DIR / "backup_path.json"
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-file_handler = logging.FileHandler(log_file_path)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
 
 
-TOKENS_PATH = SCRIPT_DIR / '.garth'
+TOKENS_PATH = DATA_DIR / '.garth'
 ENV_PATH = SCRIPT_DIR / '.env'
 MYWHOOSH_LOGIN_URL = "https://services.mywhoosh.com/http-service/api/login"
 MYWHOOSH_ACTIVITIES_URL = ("https://service14.mywhoosh.com"
@@ -95,13 +93,35 @@ GARMIN_ACTIVITIES_PATH = "/activitylist-service/activities/search/activities"
 # only absorbs rounding.
 SAME_RIDE_TOLERANCE = timedelta(seconds=60)
 # Only rides this recent are caught up, so old history is never queried.
-CATCH_UP_WINDOW = timedelta(days=14)
-FILE_DIALOG_TITLE = "MyWhoosh2Garmin"
+CATCH_UP_WINDOW = timedelta(days=21)
+MYWHOOSH_ACTIVITY_LIMIT = 10
+OUTPUT_MANUFACTURER = Manufacturer.GARMIN.value
+OUTPUT_PRODUCT = GarminProduct.EDGE_1040.value
+OUTPUT_DEVICE_NAME = "Edge 1040"
 # Fix for https://github.com/JayQueue/MyWhoosh2Garmin/issues/2
 MYWHOOSH_PREFIX_WINDOWS = "MyWhooshTechnologyService."
 GPX_NS = "{http://www.topografix.com/GPX/1/1}"
 TPX_NS = "{http://www.garmin.com/xmlschemas/TrackPointExtension/v1}"
 EARTH_RADIUS_M = 6371000.0
+
+
+def configure_logging():
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if os.environ.get("LOG_TO_FILE", "1") != "0":
+        handlers.append(RotatingFileHandler(
+            DATA_DIR / "myWhoosh2Garmin.log", maxBytes=5 * 1024 * 1024,
+            backupCount=3, encoding="utf-8"
+        ))
+    for handler in handlers:
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(message)s"
+        ))
+        logger.addHandler(handler)
 
 
 def get_fitfile_location() -> Path:
@@ -112,10 +132,15 @@ def get_fitfile_location() -> Path:
         Path: The path to the FIT file directory.
 
     Raises:
-        RuntimeError: If the operating system is unsupported.
-        SystemExit: If the target path does not exist.
+        UserError: If the path is missing or the platform needs an explicit path.
     """
-    if os.name == "posix":  # macOS and Linux
+    configured = os.environ.get("MYWHOOSH_LOCAL_DIR")
+    if configured:
+        target_path = Path(configured).expanduser()
+        if not target_path.is_dir():
+            raise UserError("MYWHOOSH_LOCAL_DIR must be an existing directory")
+        return target_path
+    if sys.platform == "darwin":
         target_path = (
            Path.home()
            / "Library"
@@ -131,74 +156,46 @@ def get_fitfile_location() -> Path:
         )
         if target_path.is_dir():
             return target_path
-        else:
-            logger.error(f"Target path {target_path} does not exist. "
-                         "Check your MyWhoosh installation.")
-            sys.exit(1)
-    elif os.name == "nt":  # Windows
-        try:
-            base_path = Path.home() / "AppData" / "Local" / "Packages"
-            for directory in base_path.iterdir():
-                if (directory.is_dir() and
-                        directory.name.startswith(MYWHOOSH_PREFIX_WINDOWS)):
-                    target_path = (
-                            directory
-                            / "LocalCache"
-                            / "Local"
-                            / "MyWhoosh"
-                            / "Content"
-                            / "Data"
-                )
-            if target_path.is_dir():
-                return target_path
-            else:
-                raise FileNotFoundError(f"No valid MyWhoosh directory found in {target_path}")
-        except FileNotFoundError as e:
-                logger.error(str(e))
-        except PermissionError as e:
-                logger.error(f"Permission denied: {e}")
-        except Exception as e:
-                logger.error(f"Unexpected error: {e}")
+        raise UserError("MyWhoosh export directory not found; set MYWHOOSH_LOCAL_DIR")
+    elif os.name == "nt":
+        base_path = Path.home() / "AppData" / "Local" / "Packages"
+        if base_path.is_dir():
+            for directory in sorted(base_path.glob(f"{MYWHOOSH_PREFIX_WINDOWS}*")):
+                target_path = directory / "LocalCache/Local/MyWhoosh/Content/Data"
+                if target_path.is_dir():
+                    return target_path
+        raise UserError("No valid MyWhoosh export directory found; set MYWHOOSH_LOCAL_DIR")
     else:
-        logger.error("Unsupported OS")
-        sys.exit(1)
+        raise UserError("Set MYWHOOSH_LOCAL_DIR to use --local on this platform")
 
 
 def get_backup_path(json_file=json_file_path) -> Path:
-    """
-    This function checks if a backup path already exists in a JSON file.
-    If it does, it returns the stored path. If the file does not exist,
-    it prompts the user to select a directory via a file dialog, saves
-    the selected path to the JSON file, and returns it.
-
-    Args:
-        json_file (str): Path to the JSON file containing the backup path.
-
-    Returns:
-        str or None: The selected backup path or None if no path was selected.
-    """
-    if os.path.exists(json_file):
+    """Resolve the configured folder, retaining support for legacy JSON config."""
+    configured = os.environ.get("MYWHOOSH_BACKUP_DIR")
+    if configured:
+        backup_path = Path(configured).expanduser()
+    elif os.path.exists(json_file):
         with open(json_file, 'r') as f:
-            backup_path = json.load(f).get('backup_path')
-        if backup_path and os.path.isdir(backup_path):
-            logger.info(f"Using backup path from JSON: {backup_path}.")
-            return Path(backup_path)
-        else:
-            logger.error("Invalid backup path stored in JSON.")
-            sys.exit(1)
+            stored = json.load(f).get('backup_path')
+        if not stored or not Path(stored).is_dir():
+            raise UserError("Invalid backup path stored in backup_path.json")
+        backup_path = Path(stored)
     else:
-        # root = tk.Tk()
-        # root.withdraw()
-        # backup_path = filedialog.askdirectory(title=f"Select {FILE_DIALOG_TITLE} "
-        #                                       "Directory")
-        backup_path = str(SCRIPT_DIR / "backups")
-        os.makedirs(backup_path, exist_ok=True)
-        with open(json_file, 'w') as f:
-            json.dump({'backup_path': backup_path}, f)
-        logger.info(f"Backup path saved to {json_file}.")
-    return Path(backup_path)
+        backup_path = DATA_DIR / "backups"
+    backup_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return backup_path
 
-BACKUP_FITFILE_LOCATION = get_backup_path()
+
+def save_garmin_session():
+    """Persist refreshed tokens without exposing partially written files."""
+    TOKENS_PATH.mkdir(parents=True, exist_ok=True, mode=0o700)
+    TOKENS_PATH.chmod(0o700)
+    with tempfile.TemporaryDirectory(dir=DATA_DIR) as directory:
+        garth.save(directory)
+        for source in Path(directory).iterdir():
+            with atomic_target(TOKENS_PATH / source.name) as target:
+                target.write_bytes(source.read_bytes())
+
 
 def get_credentials_for_garmin():
     """
@@ -215,15 +212,14 @@ def get_credentials_for_garmin():
     logger.info("Authenticating...")
     try:
         garth.login(username, password)
-        garth.save(TOKENS_PATH)
+        save_garmin_session()
         print()
         logger.info("Successfully authenticated!")
     except GarthHTTPError:
-        logger.info("Wrong credentials. Please check username and password.")
-        sys.exit(1)
+        raise UserError("Garmin login failed; check credentials, MFA and service availability") from None
 
 
-def authenticate_to_garmin():
+def authenticate_to_garmin(interactive=True):
     """
     Authenticate the user to Garmin by checking for existing tokens and
     resuming the session, or prompting for credentials if no session
@@ -239,19 +235,24 @@ def authenticate_to_garmin():
         if TOKENS_PATH.exists():
             garth.resume(TOKENS_PATH)
             try:
-                logger.info(f"Authenticated as: {garth.client.username}")
+                _ = garth.client.username  # Also checks/refreshes the resumed session.
+                save_garmin_session()
+                logger.info("Authenticated to Garmin Connect.")
             except GarthException:
+                if not interactive:
+                    raise UserError("Garmin session expired; run --login interactively") from None
                 logger.info("Session expired. Re-authenticating...")
                 get_credentials_for_garmin()
         else:
+            if not interactive:
+                raise UserError("No Garmin session; run --login interactively first")
             logger.info("No existing session. Please log in.")
             get_credentials_for_garmin()
-    except GarthException as e:
-        logger.info(f"Authentication error: {e}")
-        sys.exit(1)
+    except GarthException:
+        raise UserError("Garmin authentication failed; run --login interactively") from None
 
 
-def calculate_avg(values: iter) -> int:
+def calculate_avg(values) -> float:
     """
     Calculate the average of a list of values, returning 0 if the list is empty.
 
@@ -261,7 +262,8 @@ def calculate_avg(values: iter) -> int:
     Returns:
         float: The average value or 0 if the list is empty.
     """
-    return sum(values) / len(values) if values else 0
+    present = [value for value in values if value is not None]
+    return sum(present) / len(present) if present else 0
 
 
 def append_value(values: List[int], message: object, field_name: str) -> None:
@@ -276,20 +278,39 @@ def append_value(values: List[int], message: object, field_name: str) -> None:
     Returns:
         None
     """
-    value=getattr(message, field_name, None)
-    values.append(value if value else 0)
+    value = getattr(message, field_name, None)
+    if value is not None:
+        values.append(value)
 
 
-def reset_values() -> tuple[List[int], List[int], List[int], List[int]]:
-    """
-    Resets and returns three empty lists for cadence, power
-    and heart rate values.
+def reset_values() -> tuple[List[int], List[int], List[int]]:
+    """Return empty cadence, power and heart-rate collections."""
+    return [], [], []
 
-    Returns:
-        tuple: A tuple containing three empty lists
-        (cadence, power, and heart rate).
-    """
-    return  [], [], [], []
+
+def set_fit_value(message, name, value):
+    """Decoded FIT fields have fixed wire sizes; permit adding missing fields."""
+    field = message.get_field_by_name(name)
+    if field is not None:
+        field.growable = True
+    setattr(message, name, value)
+
+
+def set_output_device(message):
+    """Identify the recording device, not any attached sensors, as an Edge 1040."""
+    set_fit_value(message, "manufacturer", OUTPUT_MANUFACTURER)
+    set_fit_value(message, "product", OUTPUT_PRODUCT)
+    if isinstance(message, DeviceInfoMessage):
+        set_fit_value(message, "product_name", OUTPUT_DEVICE_NAME)
+
+
+def primary_device_info(timestamp=None):
+    message = DeviceInfoMessage()
+    message.device_index = 0
+    if timestamp is not None:
+        message.timestamp = timestamp
+    set_output_device(message)
+    return message
 
 
 def cleanup_fit_file(fit_file_path: Path, new_file_path: Path) -> None:
@@ -306,40 +327,41 @@ def cleanup_fit_file(fit_file_path: Path, new_file_path: Path) -> None:
     """
     builder = FitFileBuilder()
     fit_file = FitFile.from_file(str(fit_file_path))
-    lap_values, cadence_values, power_values, heart_rate_values = reset_values()
+    cadence_values, power_values, heart_rate_values = reset_values()
+    has_primary_device = any(isinstance(r.message, DeviceInfoMessage)
+                             and r.message.device_index == 0 for r in fit_file.records)
 
     for record in fit_file.records:
         message = record.message
+        is_primary_device = isinstance(message, DeviceInfoMessage) and message.device_index == 0
+        if isinstance(message, (FileIdMessage, RecordMessage, SessionMessage)) or is_primary_device:
+            # Rebuild wire definitions from the edited fields. Keeping the
+            # decoded definition would silently discard newly added averages.
+            message.definition_message = None
         if isinstance(message, FileIdMessage):
             # Override manufacturer/product but keep other fields
-            message.manufacturer = 1
-            message.product = 1836
-        if isinstance(message, LapMessage):
-            append_value(lap_values, message, "start_time")
-            append_value(lap_values, message, "total_elapsed_time")
-            append_value(lap_values, message, "total_distance")
-            append_value(lap_values, message, "avg_speed")
-            append_value(lap_values, message, "max_speed")
-            append_value(lap_values, message, "avg_heart_rate")
-            append_value(lap_values, message, "max_heart_rate")
-            append_value(lap_values, message, "avg_cadence")
-            append_value(lap_values, message, "max_cadence")
-            append_value(lap_values, message, "total_calories")
+            set_output_device(message)
+        if is_primary_device:
+            set_output_device(message)
         if isinstance(message, RecordMessage):
             message.remove_field(RecordTemperatureField.ID)
             append_value(cadence_values, message, "cadence")
             append_value(power_values, message, "power")
             append_value(heart_rate_values, message, "heart_rate")
         if isinstance(message, SessionMessage):
-            if not message.avg_cadence:
-                message.avg_cadence = calculate_avg(cadence_values)
-            if not message.avg_power:
-                message.avg_power = calculate_avg(power_values)
-            if not message.avg_heart_rate:
-                message.avg_heart_rate = calculate_avg(heart_rate_values)
-            lap_values, cadence_values, power_values, heart_rate_values = reset_values()
+            if message.avg_cadence is None and cadence_values:
+                set_fit_value(message, "avg_cadence", calculate_avg(cadence_values))
+            if message.avg_power is None and power_values:
+                set_fit_value(message, "avg_power", calculate_avg(power_values))
+            if message.avg_heart_rate is None and heart_rate_values:
+                set_fit_value(message, "avg_heart_rate", calculate_avg(heart_rate_values))
+            cadence_values, power_values, heart_rate_values = reset_values()
         builder.add(message)
-    builder.build().to_file(str(new_file_path))
+        if isinstance(message, FileIdMessage) and not has_primary_device:
+            builder.add(primary_device_info(message.time_created))
+            has_primary_device = True
+    with atomic_target(new_file_path) as target:
+        builder.build().to_file(str(target))
     logger.info(f"Cleaned-up file saved as {new_file_path}")
 
 
@@ -361,7 +383,7 @@ def haversine_distance(start: tuple, end: tuple) -> float:
     delta_lambda = math.radians(lon2 - lon1)
     a = (math.sin(delta_phi / 2) ** 2
          + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2)
-    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
+    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(min(1.0, max(0.0, a))))
 
 
 def parse_gpx_trackpoints(gpx_file_path: Path) -> List[dict]:
@@ -396,7 +418,7 @@ def parse_gpx_trackpoints(gpx_file_path: Path) -> List[dict]:
         track_point = (None if extensions is None
                        else extensions.find(f"{TPX_NS}TrackPointExtension"))
 
-        def reading(tag):
+        def reading(tag, track_point=track_point):
             if track_point is None:
                 return None
             element = track_point.find(f"{TPX_NS}{tag}")
@@ -407,9 +429,9 @@ def parse_gpx_trackpoints(gpx_file_path: Path) -> List[dict]:
             "latitude": float(point.get("lat")),
             "longitude": float(point.get("lon")),
             "altitude": float(elevation.text) if elevation is not None else 0.0,
-            "power": round(float(power.text)) if power is not None else 0,
-            "heart_rate": int(reading("hr") or 0),
-            "cadence": int(reading("cad") or 0),
+            "power": round(float(power.text)) if power is not None else None,
+            "heart_rate": int(reading("hr")) if reading("hr") is not None else None,
+            "cadence": int(reading("cad")) if reading("cad") is not None else None,
         })
 
     return trackpoints
@@ -437,6 +459,9 @@ def convert_gpx_to_fit(gpx_file_path: Path, new_file_path: Path) -> None:
     trackpoints = parse_gpx_trackpoints(gpx_file_path)
     if not trackpoints:
         raise ValueError(f"No trackpoints found in {gpx_file_path.name}")
+    if any(b["timestamp"] <= a["timestamp"]
+           for a, b in zip(trackpoints, trackpoints[1:])):
+        raise ValueError("GPX timestamps must be strictly increasing")
 
     builder = FitFileBuilder(auto_define=True)
     start_time = round(trackpoints[0]["timestamp"].timestamp() * 1000)
@@ -444,10 +469,10 @@ def convert_gpx_to_fit(gpx_file_path: Path, new_file_path: Path) -> None:
 
     file_id_message = FileIdMessage()
     file_id_message.type = FileType.ACTIVITY
-    file_id_message.manufacturer = 1
-    file_id_message.product = 1836
+    set_output_device(file_id_message)
     file_id_message.time_created = start_time
     builder.add(file_id_message)
+    builder.add(primary_device_info(start_time))
 
     cadence_values, power_values, heart_rate_values = [], [], []
     speed_values = []
@@ -473,14 +498,15 @@ def convert_gpx_to_fit(gpx_file_path: Path, new_file_path: Path) -> None:
         record_message.altitude = point["altitude"]
         record_message.distance = distance
         record_message.speed = speed
-        record_message.power = point["power"]
-        record_message.heart_rate = point["heart_rate"]
-        record_message.cadence = point["cadence"]
+        for field in ("power", "heart_rate", "cadence"):
+            if point[field] is not None:
+                setattr(record_message, field, point[field])
         builder.add(record_message)
 
-        cadence_values.append(point["cadence"])
-        power_values.append(point["power"])
-        heart_rate_values.append(point["heart_rate"])
+        for field, values in (("cadence", cadence_values), ("power", power_values),
+                              ("heart_rate", heart_rate_values)):
+            if point[field] is not None:
+                values.append(point[field])
         speed_values.append(speed)
         previous = point
 
@@ -497,16 +523,15 @@ def convert_gpx_to_fit(gpx_file_path: Path, new_file_path: Path) -> None:
     lap_message.total_distance = distance
     lap_message.avg_speed = average_speed
     lap_message.max_speed = max(speed_values)
-    lap_message.avg_power = calculate_avg(power_values)
-    lap_message.max_power = max(power_values)
-    lap_message.avg_cadence = calculate_avg(cadence_values)
-    lap_message.max_cadence = max(cadence_values)
-    lap_message.avg_heart_rate = calculate_avg(heart_rate_values)
-    lap_message.max_heart_rate = max(heart_rate_values)
     lap_message.event = Event.LAP
     lap_message.event_type = EventType.STOP
     lap_message.lap_trigger = LapTrigger.SESSION_END
     lap_message.sport = Sport.CYCLING
+    for field, values in (("power", power_values), ("cadence", cadence_values),
+                          ("heart_rate", heart_rate_values)):
+        if values:
+            setattr(lap_message, f"avg_{field}", calculate_avg(values))
+            setattr(lap_message, f"max_{field}", max(values))
     builder.add(lap_message)
 
     session_message = SessionMessage()
@@ -518,12 +543,11 @@ def convert_gpx_to_fit(gpx_file_path: Path, new_file_path: Path) -> None:
     session_message.total_distance = distance
     session_message.avg_speed = average_speed
     session_message.max_speed = max(speed_values)
-    session_message.avg_power = calculate_avg(power_values)
-    session_message.max_power = max(power_values)
-    session_message.avg_cadence = calculate_avg(cadence_values)
-    session_message.max_cadence = max(cadence_values)
-    session_message.avg_heart_rate = calculate_avg(heart_rate_values)
-    session_message.max_heart_rate = max(heart_rate_values)
+    for field, values in (("power", power_values), ("cadence", cadence_values),
+                          ("heart_rate", heart_rate_values)):
+        if values:
+            setattr(session_message, f"avg_{field}", calculate_avg(values))
+            setattr(session_message, f"max_{field}", max(values))
     session_message.first_lap_index = 0
     session_message.num_laps = 1
     session_message.sport = Sport.CYCLING
@@ -542,35 +566,22 @@ def convert_gpx_to_fit(gpx_file_path: Path, new_file_path: Path) -> None:
     activity_message.event_type = EventType.STOP
     builder.add(activity_message)
 
-    builder.build().to_file(str(new_file_path))
+    with atomic_target(new_file_path) as target:
+        builder.build().to_file(str(target))
     logger.info(f"Converted {gpx_file_path.name} to {new_file_path.name} "
                 f"({len(trackpoints)} records, {distance:.0f} m).")
 
 
 def get_most_recent_gpx_file(fitfile_location: Path) -> Optional[Path]:
-    """
-    Returns the most recent .gpx file based
-    on versioning in the filename.
-    """
-    gpx_files = fitfile_location.glob("MyNewActivity-*.gpx")
-    gpx_files = sorted(gpx_files, key=lambda f:
-                       tuple(map(int, re.findall(r'(\d+)',
-                                                 f.stem.split('-')[-1]))),
-                       reverse=True)
-    return gpx_files[0] if gpx_files else None
+    """Return the GPX export most recently written, irrespective of version."""
+    return max(fitfile_location.glob("MyNewActivity-*.gpx"),
+               key=lambda f: (f.stat().st_mtime_ns, f.name), default=None)
 
 
 def get_most_recent_fit_file(fitfile_location: Path) -> Optional[Path]:
-    """
-    Returns the most recent .fit file based
-    on versioning in the filename.
-    """
-    fit_files = fitfile_location.glob("MyNewActivity-*.fit")
-    fit_files = sorted(fit_files, key=lambda f:
-                       tuple(map(int, re.findall(r'(\d+)',
-                                                 f.stem.split('-')[-1]))),
-                       reverse=True)
-    return fit_files[0] if fit_files else None
+    """Return the FIT export most recently written, irrespective of version."""
+    return max(fitfile_location.glob("MyNewActivity-*.fit"),
+               key=lambda f: (f.stat().st_mtime_ns, f.name), default=None)
 
 
 def generate_new_filename(fit_file: Path) -> str:
@@ -592,11 +603,7 @@ def resolve_backup_target(filename: str) -> Path:
     Exits:
         Exits with status 1 if the backup folder has gone missing.
     """
-    if not BACKUP_FITFILE_LOCATION.exists():
-        logger.error(f"{BACKUP_FITFILE_LOCATION} does not exist. "
-                     "Did you delete it?")
-        sys.exit(1)
-    return BACKUP_FITFILE_LOCATION / filename
+    return get_backup_path() / filename
 
 
 def get_most_recent_activity_file(fitfile_location: Path) -> Optional[Path]:
@@ -621,7 +628,7 @@ def get_most_recent_activity_file(fitfile_location: Path) -> Optional[Path]:
     if not candidates:
         return None
     return max(candidates,
-               key=lambda f: (f.stat().st_mtime, f.suffix == ".fit"))
+               key=lambda f: (f.stat().st_mtime_ns, f.suffix == ".fit"))
 
 
 def cleanup_and_save_activity_file(fitfile_location: Path) -> Optional[Path]:
@@ -629,7 +636,7 @@ def cleanup_and_save_activity_file(fitfile_location: Path) -> Optional[Path]:
     Clean up the most recent activity file in a directory and save it as a
     .fit file with a timestamped filename.
 
-    A .fit export is cleaned in place; a .gpx export is converted first,
+    A .fit export is cleaned into a new backup; a .gpx export is converted,
     since MyWhoosh does not always write a .fit file.
 
     Args:
@@ -644,9 +651,7 @@ def cleanup_and_save_activity_file(fitfile_location: Path) -> Optional[Path]:
         processed.
     """
     if not fitfile_location.is_dir():
-        logger.error(f"The specified path is not a directory: "
-                     f"{fitfile_location}.")
-        sys.exit(1)
+        raise UserError("The local export path must be an existing directory")
 
     logger.debug(f"Checking for activity files in directory: "
                  f"{fitfile_location}.")
@@ -668,9 +673,8 @@ def cleanup_and_save_activity_file(fitfile_location: Path) -> Optional[Path]:
         logger.info(f"Successfully cleaned {activity_file.name} "
                     f"and saved it as {new_file_path.name}.")
         return new_file_path
-    except Exception as e:
-        logger.error(f"Failed to process {activity_file.name}: {e}.")
-        sys.exit(1)
+    except Exception as error:
+        raise UserError(f"Failed to process {activity_file.name} ({type(error).__name__})") from None
 
 
 def get_credentials_for_mywhoosh() -> tuple[str, str]:
@@ -685,20 +689,53 @@ def get_credentials_for_mywhoosh() -> tuple[str, str]:
         Exits with status 1 if either is missing.
     """
     values = {**dotenv_values(ENV_PATH, interpolate=False), **os.environ}
-    email = values.get("MYWHOOSH_EMAIL")
-    password = values.get("MYWHOOSH_PASSWORD")
+    def secret(name):
+        filename = values.get(f"{name}_FILE")
+        if filename:
+            # Preserve spaces and literal $, quotes and backslashes in passwords.
+            try:
+                return Path(filename).read_text(encoding="utf-8").rstrip("\r\n")
+            except (OSError, UnicodeError):
+                raise UserError(f"Cannot read {name}_FILE; check the path, permissions and UTF-8 encoding") from None
+        return values.get(name)
+
+    email = secret("MYWHOOSH_EMAIL")
+    password = secret("MYWHOOSH_PASSWORD")
     if not email or not password:
-        logger.error(f"Set MYWHOOSH_EMAIL and MYWHOOSH_PASSWORD in {ENV_PATH}.")
-        sys.exit(1)
+        raise UserError("Set MYWHOOSH_EMAIL and MYWHOOSH_PASSWORD, or their _FILE paths")
     return email, password
+
+
+def get_mywhoosh_device_id() -> str:
+    """Keep one device identity per data directory, including after failed logins."""
+    path = DATA_DIR / "mywhoosh_device_id.json"
+    with process_lock(DATA_DIR / "mywhoosh_device.lock"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            value = data["device_id"]
+            if not isinstance(value, str):
+                raise ValueError
+            device_id = str(uuid.UUID(value))
+        except FileNotFoundError:
+            device_id = str(uuid.uuid4())
+            # Persist before contacting MyWhoosh: a refused login or a network
+            # timeout must not cause the next attempt to invent another device.
+            write_json(path, {"device_id": device_id})
+        except (ValueError, KeyError, TypeError):
+            raise UserError("Invalid mywhoosh_device_id.json; restore a valid copy "
+                            "to preserve the MyWhoosh device identity") from None
+        except OSError:
+            raise UserError("Cannot read mywhoosh_device_id.json; check data directory permissions") from None
+    logger.info("Using persistent MyWhoosh device identity.")
+    return device_id
 
 
 def authenticate_to_mywhoosh(email: str, password: str) -> tuple[str, str]:
     """
     Log in to the MyWhoosh cloud API.
 
-    MyWhoosh allows one session per account, so the login is refused while
-    the app is running.
+    Reuse this installation's device ID. MyWhoosh may refuse the login if
+    another session is still active; this does not identify the other device.
 
     Args:
         email (str): The MyWhoosh account email.
@@ -707,57 +744,55 @@ def authenticate_to_mywhoosh(email: str, password: str) -> tuple[str, str]:
     Returns:
         tuple[str, str]: The access token and the WhooshId.
 
-    Exits:
-        Exits with status 1 if the login is refused.
+    Raises:
+        UserError: If the device identity is invalid or the login is refused.
     """
+    device_id = get_mywhoosh_device_id()
     response = requests.post(MYWHOOSH_LOGIN_URL, json={
         "Username": email,
         "Password": password,
         "Platform": "Android",
         "Action": 1001,
         "CorrelationId": str(uuid.uuid4()),
-        "DeviceId": str(uuid.uuid4()),
+        "DeviceId": device_id,
         "Authorization": "",
     }, timeout=30)
     response.raise_for_status()
     data = response.json()
     if not data.get("Success"):
-        message = data.get("Message", "unknown error")
-        logger.error(f"MyWhoosh login failed: {message}")
+        message = str(data.get("Message", ""))
         if "already logged in" in message.lower():
-            logger.error("Quit the MyWhoosh app and run again.")
-        sys.exit(1)
+            raise UserError("MyWhoosh reports another active session; close any open "
+                            "MyWhoosh apps and retry later. A previous session may still be active")
+        # Do not log arbitrary authentication responses or request objects.
+        raise UserError("MyWhoosh login refused; check credentials and account availability")
     logger.info("Authenticated to MyWhoosh.")
     return data["AccessToken"], data["WhooshId"]
 
 
 def get_recent_mywhoosh_activities(access_token: str) -> List[dict]:
-    """
-    Fetch the most recent activities from the MyWhoosh cloud, newest first.
-
-    The API returns ten activities per page whatever limit is asked for.
-
-    Args:
-        access_token (str): The token returned by authenticate_to_mywhoosh.
-
-    Returns:
-        List[dict]: The activities, possibly empty.
-    """
+    """Fetch only the ten newest rides; the caller applies the 21-day cutoff."""
     response = requests.post(
         MYWHOOSH_ACTIVITIES_URL,
         headers={"Authorization": f"Bearer {access_token}"},
-        json={"page": 1, "limit": 10, "sortDate": "DESC"},
+        json={"page": 1, "limit": MYWHOOSH_ACTIVITY_LIMIT, "sortDate": "DESC"},
         timeout=30
     )
     response.raise_for_status()
-    return response.json()["data"]["results"]
+    activities = response.json()["data"]["results"]
+    if not isinstance(activities, list) or any(not isinstance(a, dict) for a in activities):
+        raise UserError("MyWhoosh returned an invalid activity page")
+    return activities[:MYWHOOSH_ACTIVITY_LIMIT]
 
 
 def mywhoosh_start_time(activity: dict) -> datetime:
     """Return the ride's start time as an aware UTC datetime."""
-    return datetime.fromisoformat(
+    start = datetime.fromisoformat(
         activity["startDatetime"].replace("Z", "+00:00")
     )
+    if start.tzinfo is None:
+        raise ValueError("MyWhoosh start time is missing its timezone")
+    return start.astimezone(timezone.utc)
 
 
 def get_garmin_start_times(ride_starts: List[datetime]) -> List[datetime]:
@@ -790,10 +825,19 @@ def get_garmin_start_times(ride_starts: List[datetime]) -> List[datetime]:
                 datetime.fromisoformat(a["startTimeGMT"])
                 .replace(tzinfo=timezone.utc)
                 for a in page
+                if is_mywhoosh_candidate(a)
             ]
             if len(page) < params["limit"]:
                 break
     return start_times
+
+
+def is_mywhoosh_candidate(activity: dict) -> bool:
+    """Do not mistake a simultaneous run/watch recording for a virtual ride."""
+    kind = (activity.get("activityType") or {}).get("typeKey", "")
+    return (kind in {"virtual_ride", "virtual_cycling"}
+            or (kind in {"cycling", "indoor_cycling"}
+                and "mywhoosh" in (activity.get("activityName") or "").lower()))
 
 
 def download_mywhoosh_activity(access_token: str, whoosh_id: str,
@@ -825,69 +869,67 @@ def download_mywhoosh_activity(access_token: str, whoosh_id: str,
 
 
 def mywhoosh_activity_filename(activity: dict) -> str:
-    """
-    Name the backup after the ride's local start time, so re-running for
-    the same ride overwrites its backup instead of adding another.
-    """
-    start = mywhoosh_start_time(activity).astimezone()
-    return f"MyWhoosh_{start:%Y-%m-%d_%H%M%S}.fit"
+    """Use UTC to avoid collisions during DST and changes between host zones."""
+    start = mywhoosh_start_time(activity)
+    return f"MyWhoosh_{start:%Y-%m-%d_%H%M%S}Z.fit"
 
 
-def fetch_and_save_new_activities() -> List[Path]:
-    """
-    Download the MyWhoosh rides from the last CATCH_UP_WINDOW that are not
-    on Garmin Connect yet, clean them up and save them into the backup
-    folder.
-
-    A ride counts as already uploaded when Garmin has an activity starting
-    at the same time. Garmin's own duplicate check compares files, and the
-    cleaned file differs from one uploaded any other way, so it would let
-    such a ride through twice.
-
-    Garmin must be authenticated before this is called.
-
-    Returns:
-        List[Path]: The saved .fit files, oldest ride first.
-
-    Raises:
-        requests.RequestException: If MyWhoosh cannot be reached.
-        GarthException: If Garmin Connect cannot be queried.
-    """
+def sync_cloud_activities() -> bool:
+    """Sync oldest first, isolating each ride's errors. Return overall success."""
     email, password = get_credentials_for_mywhoosh()
     access_token, whoosh_id = authenticate_to_mywhoosh(email, password)
     cutoff = datetime.now(timezone.utc) - CATCH_UP_WINDOW
-    recent = sorted(
-        ((a, mywhoosh_start_time(a))
-         for a in get_recent_mywhoosh_activities(access_token)),
-        key=lambda pair: pair[1]
-    )
-    recent = [(a, start) for a, start in recent if start >= cutoff]
+    recent = []
+    failed = 0
+    for activity in get_recent_mywhoosh_activities(access_token):
+        try:
+            start = mywhoosh_start_time(activity)
+            if start >= cutoff:
+                recent.append((activity, start))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            logger.error("Skipping an activity with invalid start-time metadata.")
+            failed += 1
+    recent.sort(key=lambda pair: pair[1])
     if not recent:
         logger.info(f"No MyWhoosh activities in the last "
                     f"{CATCH_UP_WINDOW.days} days.")
-        return []
+        return failed == 0
 
     garmin_starts = get_garmin_start_times([start for _, start in recent])
 
-    saved = []
+    succeeded = skipped = 0
     for activity, start in recent:
-        label = f"{activity['title']} ({activity['startDatetime']})"
+        label = f"{activity.get('title', 'MyWhoosh')} ({start.isoformat()})"
         if any(abs(start - g) <= SAME_RIDE_TOLERANCE
                for g in garmin_starts):
             logger.info(f"Already on Garmin Connect: {label}.")
+            skipped += 1
             continue
 
         logger.info(f"New MyWhoosh activity: {label}.")
-        new_file_path = resolve_backup_target(
-            mywhoosh_activity_filename(activity)
-        )
-        with tempfile.TemporaryDirectory() as download_dir:
-            downloaded = Path(download_dir) / new_file_path.name
-            download_mywhoosh_activity(access_token, whoosh_id,
-                                       activity, downloaded)
-            cleanup_fit_file(downloaded, new_file_path)
-        saved.append(new_file_path)
-    return saved
+        try:
+            new_file_path = resolve_backup_target(
+                mywhoosh_activity_filename(activity)
+            )
+            with tempfile.TemporaryDirectory() as download_dir:
+                downloaded = Path(download_dir) / new_file_path.name
+                download_mywhoosh_activity(access_token, whoosh_id,
+                                           activity, downloaded)
+                cleanup_fit_file(downloaded, new_file_path)
+            if not upload_fit_file_to_garmin(new_file_path):
+                failed += 1
+                continue
+            garmin_starts.append(start)
+            succeeded += 1
+        except Exception as error:
+            # Continue the batch. Avoid leaking presigned URLs or token-bearing
+            # exception bodies into persistent/container logs.
+            logger.error("Activity failed (%s); continuing with the next ride.",
+                         type(error).__name__)
+            failed += 1
+    logger.info("Sync complete: %d submitted, %d already present, %d failed.",
+                succeeded, skipped, failed)
+    return failed == 0
 
 
 def upload_fit_file_to_garmin(new_file_path: Path) -> bool:
@@ -898,24 +940,67 @@ def upload_fit_file_to_garmin(new_file_path: Path) -> bool:
         new_file_path (Path): The path to the .fit file to upload.
 
     Returns:
-        bool: True if the file was uploaded or Garmin already had it,
+        bool: True if Garmin confirmed/acknowledged the upload or already had it,
         False if the upload failed.
     """
     try:
         with open(new_file_path, "rb") as f:
             uploaded = garth.client.upload(f)
-            logger.debug(uploaded)
-        return True
+        # Garmin can report failures inside HTTP 200, or acknowledge a file with
+        # an uploadId and empty result lists (the response documented by garth).
+        # An acknowledgement is not proof that the activity is already visible.
+        imports = uploaded.get("detailedImportResult") if isinstance(uploaded, dict) else None
+        if not isinstance(imports, dict):
+            logger.error("Unexpected Garmin upload response for %s: no detailedImportResult object.",
+                         new_file_path.name)
+            return False
+        successes = imports.get("successes")
+        failures = imports.get("failures")
+        successes = [] if successes is None else successes
+        failures = [] if failures is None else failures
+        if not isinstance(successes, list) or not isinstance(failures, list):
+            logger.error("Unexpected Garmin import result for %s: invalid successes/failures lists.",
+                         new_file_path.name)
+            return False
+        if failures:
+            codes = set()
+            for failure in failures:
+                messages = failure.get("messages", []) if isinstance(failure, dict) else []
+                if not isinstance(messages, list):
+                    continue
+                for message in messages:
+                    code = message.get("code") if isinstance(message, dict) else None
+                    # Log numeric error codes only, never free-form server text,
+                    # which may contain account data, tokens or signed URLs.
+                    if type(code) is int and 0 <= code <= 999999:
+                        codes.add(str(code))
+                    elif isinstance(code, str) and 0 < len(code) <= 6 and code.isascii() and code.isdecimal():
+                        codes.add(code)
+            logger.error("Garmin rejected import for %s (%d failure(s); codes: %s).",
+                         new_file_path.name, len(failures), ", ".join(sorted(codes)) or "not provided")
+            return False
+        if successes:
+            logger.info("Uploaded %s to Garmin Connect.", new_file_path.name)
+            return True
+        upload_id = imports.get("uploadId")
+        if type(upload_id) is int and upload_id > 0:
+            logger.info("Garmin accepted %s (upload acknowledged; activity processing may continue).",
+                        new_file_path.name)
+            return True
+        logger.error("Garmin did not acknowledge import for %s "
+                     "(no successes, no failures, no valid uploadId).", new_file_path.name)
+        return False
     except GarthHTTPError as e:
         response = e.error.response
         if response is not None and response.status_code == 409:
             logger.info("Duplicate activity found on Garmin Connect.")
             return True
-        logger.error(f"Uploading {new_file_path.name} failed: {e}")
+        logger.error("Uploading %s failed (HTTP %s).", new_file_path.name,
+                     response.status_code if response is not None else "unknown")
         return False
 
 
-def main():
+def main(argv=None):
     """
     Main function to authenticate to Garmin, fetch, clean and save the
     FIT file, and upload it to Garmin.
@@ -929,28 +1014,68 @@ def main():
     parser = argparse.ArgumentParser(
         description="Upload recent MyWhoosh rides to Garmin Connect."
     )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="sync once (the default)")
+    mode.add_argument("--login", action="store_true", help="authenticate Garmin interactively, without syncing")
+    mode.add_argument("--schedule", action="store_true", help="run the persistent daily/interval scheduler")
+    parser.add_argument("--non-interactive", action="store_true", help="never prompt for Garmin credentials")
     parser.add_argument(
         "--local", action="store_true",
         help="read the newest export from the MyWhoosh app folder "
              "instead of downloading it from the MyWhoosh cloud"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.local and (args.schedule or args.login):
+        parser.error("--local only applies to one-shot synchronisation")
+    if args.login and args.non_interactive:
+        parser.error("--login requires interactive input")
 
-    authenticate_to_garmin()
-    if args.local:
-        new_file_path = cleanup_and_save_activity_file(get_fitfile_location())
-        new_file_paths = [new_file_path] if new_file_path else []
-    else:
-        try:
-            new_file_paths = fetch_and_save_new_activities()
-        except (requests.RequestException, GarthException) as e:
-            logger.error(f"Fetching activities failed: {e}")
-            sys.exit(1)
-
-    results = [upload_fit_file_to_garmin(path) for path in new_file_paths]
-    if not all(results):
-        sys.exit(1)
+    try:
+        os.umask(0o077)
+        DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        configure_logging()
+    except OSError:
+        print("Cannot create runtime files; check MYWHOOSH_DATA_DIR permissions.", file=sys.stderr)
+        return 1
+    try:
+        if args.schedule:
+            from scheduler import serve
+            return serve(DATA_DIR, SCRIPT_DIR / "myWhoosh2Garmin.py", logger.handlers)
+        with process_lock(DATA_DIR / "sync.lock"):
+            if args.login:
+                get_credentials_for_garmin()
+                return 0
+            authenticate_to_garmin(interactive=not args.non_interactive and sys.stdin.isatty())
+            try:
+                if args.local:
+                    path = cleanup_and_save_activity_file(get_fitfile_location())
+                    success = path is None or upload_fit_file_to_garmin(path)
+                else:
+                    success = sync_cloud_activities()
+                return 0 if success else 1
+            finally:
+                save_garmin_session()
+    except LockBusy:
+        logger.warning("Another instance is running; retry later.")
+        return 75
+    except UserError as error:
+        logger.error("%s", error)
+        return 1
+    except (requests.RequestException, GarthException) as error:
+        logger.error("Service request failed (%s). Retry later; if persistent, run --login.",
+                     type(error).__name__)
+        return 1
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        # Only our own validation messages are safe to expose. Third-party
+        # exceptions can contain server responses, tokens or signed URLs.
+        logger.error("Configuration, session or activity data error (%s). Check configuration; Garmin may need --login.",
+                     type(error).__name__)
+        return 1
+    except Exception as error:
+        logger.error("Synchronisation failed (%s); inspect the input or report the issue.",
+                     type(error).__name__)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

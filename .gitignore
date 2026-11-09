@@ -6,3 +6,12 @@
 *.lock
 !*.py.lock
 backups/
+data/
+.docker.env
+secrets/
+__pycache__/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+strava/activity_*_original.*

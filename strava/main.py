@@ -14,11 +14,15 @@ Handles authentication, session management, and tracks downloaded activities in 
 
 import json
 import os
+import secrets
 import sqlite3
+import sys
+import tempfile
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -50,8 +54,9 @@ class TokenData(BaseModel):
     @classmethod
     def from_json(cls, data: dict):
         """Create TokenData instance from JSON response."""
+        data = dict(data)
         if isinstance(data.get("expires_at"), int):
-            data["expires_at"] = datetime.fromtimestamp(data["expires_at"])
+            data["expires_at"] = datetime.fromtimestamp(data["expires_at"], timezone.utc)
         return cls(**data)
 
 
@@ -124,12 +129,10 @@ class StravaAuth:
         if not self.token_data:
             return False
 
-        if isinstance(self.token_data.expires_at, int):
-            self.token_data.expires_at = datetime.fromtimestamp(
-                self.token_data.expires_at
-            )
-
-        return datetime.now() < self.token_data.expires_at - timedelta(minutes=5)
+        expiry = self.token_data.expires_at
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) < expiry - timedelta(minutes=5)
 
     def authenticate(self) -> None:
         """Main authentication flow with automatic token refresh."""
@@ -148,20 +151,25 @@ class StravaAuth:
 
     def _perform_oauth_flow(self) -> None:
         """Perform OAuth2 authorization code flow."""
-        auth_url = (
-            f"{self.settings.auth_base_url}?"
-            f"client_id={self.settings.client_id}&"
-            "response_type=code&"
-            "redirect_uri=http://localhost/exchange_token&"
-            "scope=activity:read_all"
-        )
+        state = secrets.token_urlsafe(32)
+        auth_url = self.settings.auth_base_url + "?" + urlencode({
+            "client_id": self.settings.client_id,
+            "response_type": "code",
+            "redirect_uri": "http://localhost/exchange_token",
+            "scope": "activity:read_all",
+            "state": state,
+        })
         print(f"🔗 Authorize here: {auth_url}")
         redirect_url = input("🔄 Paste callback URL: ")
-        self._fetch_token(redirect_url)
+        self._fetch_token(redirect_url, state)
 
-    def _fetch_token(self, redirect_url: str) -> None:
+    def _fetch_token(self, redirect_url: str, expected_state: str) -> None:
         """Exchange authorization code for access token."""
-        code = parse_qs(urlparse(redirect_url).query).get("code")
+        query = parse_qs(urlparse(redirect_url).query)
+        state = query.get("state", [""])[0]
+        if not secrets.compare_digest(state, expected_state):
+            raise ValueError("OAuth callback state does not match this login attempt")
+        code = query.get("code")
         if not code:
             raise ValueError("Authorization code missing")
 
@@ -173,14 +181,21 @@ class StravaAuth:
                 "code": code[0],
                 "grant_type": "authorization_code",
             },
+            timeout=30,
         )
         response.raise_for_status()
         self._save_tokens(response.json())
 
     def _save_tokens(self, token_data: dict) -> None:
         """Save tokens to file and update session."""
-        with open(self.settings.token_file, "w") as f:
-            json.dump(token_data, f)
+        target = Path(self.settings.token_file)
+        fd, temporary = tempfile.mkstemp(dir=target.resolve().parent)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(token_data, f)
+            os.replace(temporary, target)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
         self.token_data = TokenData.from_json(token_data)
         self._initialize_session()
 
@@ -206,6 +221,7 @@ class StravaAuth:
                 "grant_type": "refresh_token",
                 "refresh_token": self.token_data.refresh_token,
             },
+            timeout=30,
         )
         response.raise_for_status()
         self._save_tokens(response.json())
@@ -224,7 +240,7 @@ class CookieManager:
             with open(self.cookie_file, "r") as f:
                 cookies = json.load(f)
             for name, value in cookies.items():
-                self.session.cookies.set(name, value)
+                self.session.cookies.set(name, value, domain=".strava.com", path="/", secure=True)
 
 
 class ActivityDownloader:
@@ -237,7 +253,7 @@ class ActivityDownloader:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
                   "image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate",
         "Connection": "keep-alive",
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
@@ -251,14 +267,12 @@ class ActivityDownloader:
         self.db = database
 
     def download_activity(self, activity_id: int) -> bool:
-        """Download activity file with retry logic."""
+        """Web exports require valid website cookies, not an OAuth refresh."""
         try:
             return self._download_attempt(activity_id)
         except requests.HTTPError as e:
-            if e.response.status_code == 401:
-                print("Token expired during download, refreshing...")
-                self.session.auth.refresh_token()
-                return self._download_attempt(activity_id)
+            if e.response is not None and e.response.status_code in {401, 403}:
+                raise ValueError("Strava website session expired; update cookie.json") from None
             raise
 
     def _download_attempt(self, activity_id: int) -> bool:
@@ -269,14 +283,31 @@ class ActivityDownloader:
         response = self.session.get(
             f"https://www.strava.com/activities/{activity_id}/export_original",
             stream=True,
-            headers=self.CHROME_HEADERS
+            headers=self.CHROME_HEADERS,
+            timeout=60,
         )
-        response.raise_for_status()
-
-        filename = f"activity_{activity_id}_original.fit"
-        with open(filename, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+        fd, temporary = tempfile.mkstemp(prefix=f".activity_{activity_id}_", dir=".")
+        try:
+            response.raise_for_status()
+            if "text/html" in response.headers.get("Content-Type", "").lower():
+                raise ValueError("Strava returned a web page; update cookie.json")
+            filename = f"activity_{activity_id}_original.fit"
+            with os.fdopen(fd, "wb") as f:
+                fd = None
+                size = 0
+                for chunk in response.iter_content(chunk_size=8192):
+                    if size == 0 and chunk.lstrip().lower().startswith((b"<!doctype html", b"<html")):
+                        raise ValueError("Strava returned a login page; update cookie.json")
+                    f.write(chunk)
+                    size += len(chunk)
+                if size == 0:
+                    raise ValueError("Strava returned an empty export")
+            os.replace(temporary, filename)
+        finally:
+            response.close()
+            if fd is not None:
+                os.close(fd)
+            Path(temporary).unlink(missing_ok=True)
 
         self.db.mark_downloaded(activity_id)
         print(f"✅ Downloaded {filename}")
@@ -294,26 +325,28 @@ class StravaClient:
         """Retrieve filtered list of activities."""
         self.auth.authenticate()
 
-        try:
+        activities = []
+        page = 1
+        refreshed = False
+        while True:
             response = self.auth.session.get(
                 self.auth.settings.activities_url,
-                params={"per_page": 100}
+                params={"per_page": 100, "page": page}, timeout=30
             )
-            response.raise_for_status()
-
-        except requests.HTTPError as e:
-            if e.response.status_code == 401:
-                print("Token expired during request, refreshing...")
+            if response.status_code == 401 and not refreshed:
                 self.auth.refresh_token()
-                return self.get_filtered_activities()
-            raise
-
-        return [
-            ActivityDetails(**activity)
-            for activity in response.json()
-            if activity.get("type") == "VirtualRide"
-            and "MyWhoosh" in activity.get("name", "")
-        ]
+                refreshed = True
+                continue
+            response.raise_for_status()
+            batch = response.json()
+            activities.extend(
+                ActivityDetails(**activity) for activity in batch
+                if activity.get("type") == "VirtualRide"
+                and "mywhoosh" in activity.get("name", "").lower()
+            )
+            if len(batch) < 100:
+                return activities
+            page += 1
 
 
 class StravaClientBuilder:
@@ -338,17 +371,14 @@ class StravaClientBuilder:
     def build(self) -> StravaClient:
         """Build configured StravaClient instance."""
         downloader = ActivityDownloader(
-            self.auth.session,
+            self.cookie_manager.session,
             self.database
         )
         return StravaClient(self.auth, downloader)
 
-    def __del__(self):
-        """Cleanup resources on deletion."""
-        self.database.close()
-
 
 if __name__ == "__main__":
+    os.umask(0o077)
     client_builder = None
     try:
         client_builder = StravaClientBuilder()
@@ -362,7 +392,7 @@ if __name__ == "__main__":
 
         if not new_activities:
             print("No new activities found")
-            exit()
+            sys.exit(0)
 
         print("\n🏆 New Virtual Rides with 'MyWhoosh' in name:")
         for activity in new_activities:
@@ -380,7 +410,8 @@ if __name__ == "__main__":
         print(f"• Total processed: {len(all_activities)}")
 
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"❌ Error ({type(e).__name__}). Check credentials, website cookies and connectivity.")
+        sys.exit(1)
     finally:
         if client_builder:
             client_builder.database.close()
