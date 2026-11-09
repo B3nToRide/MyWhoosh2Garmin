@@ -1,0 +1,32 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --require-hashes -r android/requirements.txt
+      - run: python -m pip install --no-deps -r tests/requirements.txt
+      - run: python -m unittest discover -s tests -v
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose --env-file .docker.env.example config --quiet
+      - run: docker build -t mywhoosh2garmin:local .
+      - run: docker run --rm --network none --read-only mywhoosh2garmin:local --help
+      - run: python3 tests/docker_smoke.py

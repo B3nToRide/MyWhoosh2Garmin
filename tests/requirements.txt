@@ -1,0 +1,2 @@
+# Only needed for the optional Strava regression tests; same pin as its lock.
+pydantic-settings==2.15.0
