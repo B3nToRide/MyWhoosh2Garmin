@@ -6,7 +6,9 @@ the Docker image or the scheduler, and it does not upload anything to Garmin.
 `main.py` lists activities through the Strava API and uses a separate website
 cookie session to download original exports from
 `https://www.strava.com/activities/{activity.id}/export_original`.
-I did this because we are not allowed to scrape MyWhoosh site. It's in the TOS.
+This is a separate upstream-derived export tool, not a prerequisite or fallback
+for the main MyWhoosh cloud-sync workflow. Check the current platform terms
+before using website endpoints; this guide does not establish permission to scrape.
 
 ## Installation
 

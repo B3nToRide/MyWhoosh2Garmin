@@ -1,16 +1,35 @@
-<h1>Apple Script to automate Garmin Upload</h1>
-<p>The app will run and constantly check (every 30 seconds) whether MyWhoosh is running. Once started, it will listen to My Whoosh being quit/exited. In case My Whoosh was exited/quit, it will run the myWhoosh2Garmin.py script that needs to be installed and setup previously.</p>
-<h2>🛠️ Installation Steps:</h2>
-<ol>
-  <li>Download MyWhoosh2Garmin-AS.scpt to your filesystem to a folder of your choosing.</li>
-  <li>Go to the folder where you downloaded the script via Mac Finder.</li>
-  <li>Open the script in the Apple Script Editor and set the property <code>pythonScriptPath</code> to the location where you downloaded the 
-  <code>myWhoosh2Garmin.py</code> script. <code>do shell script</code> runs with a minimal PATH, so <code>uv</code>
-  is called by its full path below; adjust it if <code>which uv</code> reports a different location.</li>
-  
-```
+# Legacy AppleScript launcher — optional, not live-validated
+
+For scheduled automation, use the [Docker guide](../docs/docker.md). This
+upstream-derived launcher is retained for people who want a **native macOS sync
+after quitting MyWhoosh**, not a daily or elapsed-time scheduler. It is not used
+by Docker and has not been live-tested as part of this fork.
+
+## Prerequisites
+
+1. Follow the [native installation](../README.md#native-installation) using the
+   complete checkout. Downloading only `myWhoosh2Garmin.py` is insufficient.
+2. Configure MyWhoosh credentials in `.env` next to the Python script.
+3. Run `uv run --locked myWhoosh2Garmin.py --login` in an interactive terminal,
+   including MFA if required, then test `--once --non-interactive` manually.
+4. Run `command -v uv` and note its absolute path. Do not assume it is installed
+   at `$HOME/.local/bin/uv`.
+
+`do shell script` has no interactive terminal and does not inherit the runtime
+variables exported in your Terminal session. Use the same data-directory
+configuration for login and the launcher; otherwise it will not find the Garmin
+session. If that session expires, re-authenticate in Terminal, not in the app.
+
+## Adapt the launcher before exporting it
+
+Open `MyWhoosh2Garmin-AS.scpt` in Script Editor. The bundled compiled script is
+unchanged and contains the older invocation: **replace its source with the
+example below**, then set the application name and both absolute paths.
+
+```applescript
 property targetApp : "MyWhoosh Indoor Cycling App"
-property pythonScriptPath : "/path/to/myWhoosh2Garmin.py"
+property uvExecutablePath : "/absolute/path/to/uv"
+property pythonScriptPath : "/absolute/path/to/MyWhoosh2Garmin/myWhoosh2Garmin.py"
 property appRunning : false
 
 on idle
@@ -24,22 +43,28 @@ on idle
 end idle
 
 on performActionOnExit()
-	do shell script "$HOME/.local/bin/uv run " & quoted form of pythonScriptPath
+	do shell script (quoted form of uvExecutablePath) & " run --locked " & (quoted form of pythonScriptPath) & " --once --non-interactive"
 end performActionOnExit
 
 on quit
 	continue quit
 end quit
-
 ```
 
-  <li>After changing the property file, export the file as an app.</li>
-  <li>Please select File Format <code>Application</code>.</li>
-  <li>Please select <code>Stay open after run handler</code> an export option.</li>
-  <li>Store the app at a location of your choice.
-	<img width="1100" alt="Xnip2024-12-30_22-16-55" src="https://github.com/user-attachments/assets/54fa1ab0-2ed3-46a0-808e-1420c29c7736" />
-  </li>
-  <li>Before running the script, you need to grant the app full access to your hard drive. Otherwise, you will be prompted each time to allow access when the myWhoosh2Garmin is executed. Please search the web for a guide, given it slightly depends on your Mac OS version. See screenshot of my setup (I gave my App the My Whoosh icon): <img width="827" alt="Xnip2024-12-30_22-28-22" src="https://github.com/user-attachments/assets/c4004375-36ef-42c1-936f-99eba47639c6" />
-  </li>
-  <li>Now you can run the App and start riding on My Whoosh. After you exit My Whoosh the Garmin upload script will be exectuded.</li>
-</ol>
+Export it as an **Application**, selecting **Stay open after run handler**. Launch
+that app before starting MyWhoosh. It checks every 30 seconds and submits one
+cloud sync after it has observed MyWhoosh running and then quitting.
+
+## Permissions and limitations
+
+- Full Disk Access is **not a blanket prerequisite** for cloud sync. Grant only
+  the specific automation or folder permissions macOS requests for your chosen
+  paths; do not grant broad disk access merely because an older guide said so.
+- There is no credential prompt, retry queue, persisted exit-monitor state or
+  catch-up of missed application-exit events in this launcher. Docker scheduling
+  is the documented alternative for those operational needs.
+- The native script still limits cloud catch-up to the 10 latest activities
+  within 21 days and uses its shared sync lock.
+- Errors can surface through AppleScript rather than a terminal window. Inspect
+  the native rotating log in the configured data directory and test the command
+  manually before relying on the exported app.
